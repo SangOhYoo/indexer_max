@@ -1,0 +1,29 @@
+{
+  "database": {
+    "host": "127.0.0.1",
+    "user": "DB_USER_HERE",
+    "password": "DB_PASSWORD_HERE",
+    "db": "g5",
+    "charset": "utf8mb4"
+  },
+  "manticore": {
+    "host": "127.0.0.1",
+    "port": 9406,
+    "user": "root",
+    "password": "",
+    "db": ""
+  },
+  "ollama": {
+    "hosts": [
+      "http://127.0.0.1:11434", 
+      "http://127.0.0.1:11435"
+    ]
+  },
+  "settings": {
+    "table_prefix": "g5_write_",
+    "chunk_size": 3000,
+    "overlap": 100,
+    "batch_size": 30,
+    "concurrency": 32
+  }
+}

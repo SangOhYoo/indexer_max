@@ -1,0 +1,21 @@
+# Git Ignore Files
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Database/Config
+config.json
+
+# Backups and Large Files
+backup/
+*.zip
+*.7z
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/

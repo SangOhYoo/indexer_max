@@ -1,0 +1,8 @@
+# Indexer Only Requirements
+aiomysql
+pymysql
+aiohttp
+beautifulsoup4
+lxml
+cryptography
+psutil
