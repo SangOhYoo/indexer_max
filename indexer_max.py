@@ -260,8 +260,9 @@ def clean_text(content):
 
 def chunk_text(text):
     # [스마트 가변 청크 적용]
-    MAX_LENGTH = 3000
-    MIN_LENGTH = 1500
+    # MAX_LENGTH를 2000으로 제한: CJK 문자는 ~1토큰/글자이므로 llama.cpp batch_size(2048) 이내 유지
+    MAX_LENGTH = 2000
+    MIN_LENGTH = 1000
     LOOKBACK_RANGE = 500
     OVERLAP_SIZE = OVERLAP
 
@@ -380,8 +381,8 @@ async def check_and_create_table(pool_manticore):
 async def get_embedding(session, text, host_idx, sem, bo_table):
     if not text or len(text.strip()) < 2: return None
     url = f"{OLLAMA_HOSTS[host_idx]}/v1/embeddings"
-    payload = {"model": "bge-m3", "input": [text]}
     max_retries = 10
+    current_text = text  # 토큰 초과 시 텍스트를 줄여가며 재시도
     
     async with sem:
         for attempt in range(max_retries):
@@ -389,6 +390,7 @@ async def get_embedding(session, text, host_idx, sem, bo_table):
                 wait_time = (2 ** attempt) + random.uniform(0, 1)
                 await asyncio.sleep(wait_time)
             
+            payload = {"model": "bge-m3", "input": [current_text]}
             start_time = time.time()
             try:
                 timeout = aiohttp.ClientTimeout(total=60) 
@@ -403,6 +405,12 @@ async def get_embedding(session, text, host_idx, sem, bo_table):
                         if "NaN" in error_msg or "unsupported value" in error_msg:
                             print(f"\n🗑️ [Skip-NaN] Toxic Text Detected")
                             return None
+                        # [NEW] 토큰 초과 에러 감지 → 텍스트를 80%로 잘라서 재시도
+                        if "too large to process" in error_msg or "batch size" in error_msg:
+                            old_len = len(current_text)
+                            current_text = current_text[:int(len(current_text) * 0.8)]
+                            print(f"\n⚠️ [Token Overflow] Text too long ({old_len} chars). Trimmed to {len(current_text)} chars, retrying...")
+                            continue
                         if attempt < max_retries - 1:
                             continue 
                         else:
