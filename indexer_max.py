@@ -12,6 +12,8 @@ import argparse
 import random
 import warnings
 import subprocess
+import unicodedata
+import gc
 import psutil  # [필수] pip install psutil
 from datetime import datetime
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
@@ -19,6 +21,15 @@ from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 # ==============================================================================
 # 0. 환경 설정
 # ==============================================================================
+# [한글 및 이모지 깨짐/에러 방지]
+try:
+    if sys.stdout and sys.stdout.encoding != 'utf-8':
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stderr and sys.stderr.encoding != 'utf-8':
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 CONFIG_FILE = 'config.json'
@@ -71,23 +82,28 @@ class AutoTuner:
         self.TARGET_LOAD = 85.0    # 목표 부하율 (이 수치 근처 유지 노력)
         self.CRITICAL_LIMIT = 95.0 # 위험 한계선 (즉시 감속)
 
-    def get_dual_gpu_usage(self):
+    async def get_dual_gpu_usage(self):
         """
         [핵심] 듀얼 GPU 사용률 체크
         nvidia-smi를 호출하여 GPU 중 가장 높은 메모리 사용률을 반환합니다.
         (보틀넥 방지를 위해 가장 힘든 자원을 기준으로 함)
         """
         try:
-            # GPU별 메모리 사용량 쿼리
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,nounits,noheader'],
-                capture_output=True, text=True
+            # [개선] 비동기 서브프로세스 실행으로 이벤트 루프 블로킹 방지
+            proc = await asyncio.create_subprocess_exec(
+                'nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,nounits,noheader',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            if result.returncode != 0: return 0.0
-            
-            lines = result.stdout.strip().split('\n')
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                # print(f"nvidia-smi error: {stderr.decode()}") # 디버깅용
+                return 0.0
+
+            lines = stdout.decode().strip().split('\n')
             max_gpu_usage = 0.0
-            
+
             for line in lines:
                 if not line: continue
                 parts = line.split(',')
@@ -96,13 +112,13 @@ class AutoTuner:
                     total = float(parts[1].strip())
                     if total > 0:
                         usage = (used / total) * 100
-                        if usage > max_gpu_usage:
-                            max_gpu_usage = usage
+                        max_gpu_usage = max(max_gpu_usage, usage)
             return max_gpu_usage
-        except:
+        except FileNotFoundError:
+            # nvidia-smi가 설치되지 않은 경우
             return 0.0
 
-    def tune(self):
+    async def tune(self):
         """
         [보틀넥 방지 알고리즘]
         CPU, RAM, GPU 중 가장 바쁜 자원(Max Load)을 기준으로 배치를 조절
@@ -117,7 +133,7 @@ class AutoTuner:
         # 1. 모든 자원 상태 측정
         cpu = psutil.cpu_percent()
         ram = psutil.virtual_memory().percent
-        gpu = self.get_dual_gpu_usage()
+        gpu = await self.get_dual_gpu_usage()
         
         # 2. 보틀넥(Limiting Factor) 식별
         # 시스템의 속도는 가장 느린(부하가 높은) 자원에 의해 결정됨
@@ -159,8 +175,6 @@ tuner = AutoTuner()
 def clean_text(content):
     if not content: return ""
     
-    import unicodedata
-    
     # 1. 유니코드 정규화
     content = unicodedata.normalize('NFKC', str(content))
 
@@ -172,7 +186,7 @@ def clean_text(content):
     try:
         soup = BeautifulSoup(content, "lxml")
         text = soup.get_text(separator="  ") 
-    except:
+    except Exception:
         text = str(content)
 
     # ==============================================================
@@ -238,7 +252,6 @@ def clean_text(content):
     text = re.sub(r'[~〜]{2,}', '~', text)
     text = re.sub(r'[ー−]{2,}', 'ー', text)
     text = re.sub(r'(・\s*){2,}', '...', text)
-    text = re.sub(r'(\.\s*){2,}', '...', text)
     text = re.sub(r'[!！]{2,}', '!', text)
     text = re.sub(r'[?？]{2,}', '?', text)
     text = re.sub(r'。{2,}', '。', text)
@@ -260,8 +273,8 @@ def clean_text(content):
 
 def chunk_text(text):
     # [스마트 가변 청크 적용]
-    # MAX_LENGTH를 2000으로 제한: CJK 문자는 ~1토큰/글자이므로 llama.cpp batch_size(2048) 이내 유지
-    MAX_LENGTH = 2000
+    # CHUNK_SIZE 설정값을 사용하되, 토큰 안전 한도(2000) 이내로 제한
+    MAX_LENGTH = min(CHUNK_SIZE, 2000)
     MIN_LENGTH = 1000
     LOOKBACK_RANGE = 500
     OVERLAP_SIZE = OVERLAP
@@ -300,9 +313,12 @@ def chunk_text(text):
         real_chunk = text[offset:cut_point]
         if real_chunk.strip(): chunks.append(real_chunk.strip())
         
-        offset = cut_point - OVERLAP_SIZE
-        if not (offset <= offset + OVERLAP_SIZE and offset < cut_point):
-             offset = cut_point
+        next_offset = cut_point - OVERLAP_SIZE
+        # [수정] offset이 반드시 전진하도록 보장 (무한 루프 방지)
+        if next_offset <= offset:
+            offset = cut_point
+        else:
+            offset = next_offset
 
     return chunks
 
@@ -322,6 +338,37 @@ def parse_timestamp(value):
         except ValueError:
             pass
     return 0
+
+def validate_date(date_str, is_end_date=False):
+    if not date_str or not date_str.strip():
+        return None
+    date_str = date_str.strip()
+    # 1. YYYY-MM-DD HH:MM:SS
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+        
+    # 2. YYYY-MM-DD
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        if is_end_date:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+        
+    # 3. YYYYMMDD
+    try:
+        dt = datetime.strptime(date_str, "%Y%m%d")
+        if is_end_date:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+        
+    raise ValueError(f"지원하지 않는 날짜 형식입니다: '{date_str}'. (지원 형식: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYYMMDD)")
 
 # ==============================================================================
 # 3. 핵심 로직 (Async)
@@ -381,13 +428,14 @@ async def check_and_create_table(pool_manticore):
 async def get_embedding(session, text, host_idx, sem, bo_table):
     if not text or len(text.strip()) < 2: return None
     url = f"{OLLAMA_HOSTS[host_idx]}/v1/embeddings"
-    max_retries = 10
+    max_retries = 5
     current_text = text  # 토큰 초과 시 텍스트를 줄여가며 재시도
     
     async with sem:
         for attempt in range(max_retries):
             if attempt > 0: 
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
+                # [수정] 백오프 상한 30초로 제한 (기존: 2^9=512초 가능)
+                wait_time = min(30, (2 ** attempt)) + random.uniform(0, 1)
                 await asyncio.sleep(wait_time)
             
             payload = {"model": "bge-m3", "input": [current_text]}
@@ -515,10 +563,13 @@ async def process_item_embedding(session, row, bo_table, parent_cache, sem):
         ))
     return results
 
-async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_category="", force_update=False):
+async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_category="", force_update=False, start_date=None, end_date=None):
     write_table = f"{TABLE_PREFIX}{bo_table}"
     category_msg = f" (Category: {target_category})" if target_category else ""
-    print(f"\n🔄 [SYNC START] Comparing Table: {write_table}{category_msg}")
+    date_msg = ""
+    if start_date or end_date:
+        date_msg = f" (Date: {start_date or 'Min'} ~ {end_date or 'Max'})"
+    print(f"\n🔄 [SYNC START] Comparing Table: {write_table}{category_msg}{date_msg}")
     
     gb_map = {} 
     mc_map = {}
@@ -540,6 +591,22 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
                     else:
                         where_clause = " WHERE ca_name = %s "
                     params.append(target_category)
+                
+                # 시작 날짜 필터 적용
+                if start_date:
+                    if where_clause.strip():
+                        where_clause += " AND wr_datetime >= %s "
+                    else:
+                        where_clause = " WHERE wr_datetime >= %s "
+                    params.append(start_date)
+
+                # 종료 날짜 필터 적용
+                if end_date:
+                    if where_clause.strip():
+                        where_clause += " AND wr_datetime <= %s "
+                    else:
+                        where_clause = " WHERE wr_datetime <= %s "
+                    params.append(end_date)
                         
                 query = f"SELECT wr_id, wr_last FROM {write_table} {where_clause}"
                 if params:
@@ -569,8 +636,8 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
     mc_ids = set(mc_map.keys())
     
     to_delete = []
-    # 특정 카테고리를 지정한 경우, 전체 삭제 대조를 하면 다른 카테고리가 날아가는 위험 방지
-    if not target_category:
+    # 특정 카테고리나 날짜 범위가 지정된 경우, 전체 삭제 대조를 하면 조건에 없는 다른 글들이 날아가는 위험 방지
+    if not target_category and not start_date and not end_date:
         to_delete = list(mc_ids - gb_ids)
         
     to_upsert = [] 
@@ -592,7 +659,7 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
     if not to_upsert:
         print("✅ No updates needed.")
         del gb_map, mc_map, to_delete, to_upsert
-        import gc; gc.collect()
+        gc.collect()
         return
 
     update_ids = [uid for uid in to_upsert if uid in mc_ids]
@@ -608,7 +675,7 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
     current_idx = 0
     
     while current_idx < total_ops:
-        dynamic_batch, cool_down = tuner.tune()
+        dynamic_batch, cool_down = await tuner.tune()
         if cool_down > 0: await asyncio.sleep(cool_down)
 
         end_idx = min(current_idx + dynamic_batch, total_ops)
@@ -649,23 +716,25 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
         processing_tasks = []
         current_conn = None 
 
-        for row in rows:
-            if row['wr_is_comment'] == 1:
-                # 댓글 부모 정보 조회 시에도 오류 가능성 있으므로 예외 처리
-                try:
-                    if not current_conn: current_conn = await pool_gnuboard.acquire()
-                    p_info = await get_parent_info(current_conn, write_table, row['wr_parent'], parent_cache)
-                    if p_info:
-                        row['wr_subject'] = f"↳ [Comment] {p_info['wr_subject']}"
-                        row['ca_name'] = f"{p_info['ca_name']} (Comment)" if row['ca_name'] else "Comment"
-                    else:
-                        row['wr_subject'] = "[Comment] (Deleted)"
-                except Exception:
-                     row['wr_subject'] = "[Comment] (Parent Info Error)"
+        # [수정] try/finally로 커넥션 누수 방지
+        try:
+            for row in rows:
+                if row['wr_is_comment'] == 1:
+                    # 댓글 부모 정보 조회 시에도 오류 가능성 있으므로 예외 처리
+                    try:
+                        if not current_conn: current_conn = await pool_gnuboard.acquire()
+                        p_info = await get_parent_info(current_conn, write_table, row['wr_parent'], parent_cache)
+                        if p_info:
+                            row['wr_subject'] = f"↳ [Comment] {p_info['wr_subject']}"
+                            row['ca_name'] = f"{p_info['ca_name']} (Comment)" if row['ca_name'] else "Comment"
+                        else:
+                            row['wr_subject'] = "[Comment] (Deleted)"
+                    except Exception:
+                         row['wr_subject'] = "[Comment] (Parent Info Error)"
 
-            processing_tasks.append(process_item_embedding(session, row, bo_table, parent_cache, sem))
-
-        if current_conn: pool_gnuboard.release(current_conn)
+                processing_tasks.append(process_item_embedding(session, row, bo_table, parent_cache, sem))
+        finally:
+            if current_conn: pool_gnuboard.release(current_conn)
 
         processed_batches = await asyncio.gather(*processing_tasks)
         bulk_values = []
@@ -681,18 +750,122 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
     print(f"\n✨ {bo_table} Sync Completed.")
     
     del gb_map, mc_map, to_delete, to_upsert, rows, processing_tasks
-    import gc; gc.collect()
+    gc.collect()
 
 # ==============================================================================
-# 4. 메인 실행
+# 4. 메인 실행 및 자가점검
 # ==============================================================================
+async def run_self_check():
+    print("\n========================================================")
+    print("🔍 [System Self-Check] 서비스 가동 상태 점검")
+    print("========================================================")
+    
+    # 1. MariaDB (GnuBoard DB)
+    mariadb_ok = False
+    try:
+        conn = await aiomysql.connect(
+            host=DB_CONFIG['host'],
+            port=DB_CONFIG.get('port', 3306),
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            db=DB_CONFIG['db'],
+            connect_timeout=3
+        )
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1")
+        await conn.ensure_closed()
+        print(f"  [+] MariaDB ({DB_CONFIG['host']}): 🟢 연결 성공 (OK)")
+        mariadb_ok = True
+    except Exception as e:
+        print(f"  [+] MariaDB ({DB_CONFIG['host']}): 🔴 연결 실패 ({e})")
+        
+    # 2. Manticore Search
+    manticore_ok = False
+    try:
+        conn = await aiomysql.connect(
+            host=MANTICORE_CONFIG['host'],
+            port=int(MANTICORE_CONFIG['port']),
+            user=MANTICORE_CONFIG['user'],
+            password=MANTICORE_CONFIG['password'],
+            db=MANTICORE_CONFIG.get('db', ''),
+            connect_timeout=3
+        )
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1")
+        await conn.ensure_closed()
+        print(f"  [+] Manticore Search ({MANTICORE_CONFIG['host']}:{MANTICORE_CONFIG['port']}): 🟢 연결 성공 (OK)")
+        manticore_ok = True
+    except Exception as e:
+        print(f"  [+] Manticore Search ({MANTICORE_CONFIG['host']}:{MANTICORE_CONFIG['port']}): 🔴 연결 실패 ({e})")
+
+    # 3. Ollama Hosts
+    ollama_ok = False
+    active_ollama_hosts = 0
+    async with aiohttp.ClientSession() as session:
+        for idx, host in enumerate(OLLAMA_HOSTS):
+            try:
+                # Check status via /api/tags
+                async with session.get(f"{host}/api/tags", timeout=3) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        models = [m.get('name') for m in data.get('models', [])]
+                        # Check if bge-m3 is loaded
+                        model_found = any('bge-m3' in m.lower() for m in models)
+                        model_status = "🟢 'bge-m3' 로드됨" if model_found else "⚠️ 'bge-m3' 모델 미지점 (설치된 모델 목록 확인 필요)"
+                        print(f"  [+] Ollama Host {idx+1} ({host}):")
+                        print(f"      - 서비스 상태: 🟢 가동 중 (Running)")
+                        print(f"      - 모델 상태:   {model_status}")
+                        if model_found:
+                            active_ollama_hosts += 1
+                    else:
+                        print(f"  [+] Ollama Host {idx+1} ({host}): 🔴 HTTP 오류 (상태 코드: {resp.status})")
+            except Exception as e:
+                print(f"  [+] Ollama Host {idx+1} ({host}): 🔴 연결 실패 ({e})")
+                
+    if active_ollama_hosts == len(OLLAMA_HOSTS) and len(OLLAMA_HOSTS) > 0:
+        ollama_ok = True
+
+    print("========================================================")
+    
+    # Check if critical systems are ready
+    if not mariadb_ok or not manticore_ok or not ollama_ok:
+        print("❌ [경고] 일부 필수 서비스가 준비되지 않았습니다.")
+        if not mariadb_ok:
+            print("  - MariaDB 연결 실패 (DB 서버 작동 상태 확인 필요)")
+        if not manticore_ok:
+            print("  - Manticore Search 연결 실패 (Manticore 서비스 작동 상태 확인 필요)")
+        if not ollama_ok:
+            if len(OLLAMA_HOSTS) == 0:
+                print("  - 설정 파일에 Ollama 호스트 정보가 없습니다.")
+            elif active_ollama_hosts < len(OLLAMA_HOSTS):
+                print(f"  - 일부 Ollama 호스트가 비활성 상태이거나 'bge-m3' 모델이 없습니다. ({active_ollama_hosts}/{len(OLLAMA_HOSTS)} 정상)")
+        print("========================================================")
+        
+        try:
+            print("계속 진행하시겠습니까? (y/n, 기본값: y): ", end="", flush=True)
+            loop = asyncio.get_event_loop()
+            answer = await loop.run_in_executor(None, input)
+            if answer.strip().lower() in ['n', 'no']:
+                print("❌ 사용자가 실행을 중단했습니다.")
+                sys.exit(1)
+        except (EOFError, OSError):
+            print("⚠️ 비대화형 환경이거나 입력을 받을 수 없어 자동으로 계속 진행합니다.")
+    else:
+        print("🟢 모든 필수 서비스가 정상 작동 중입니다.")
+        print("========================================================\n")
+
 async def main():
     print(f"=== Python Indexer V7.1 (Auto-Tuned) ===")
+    
+    # 자가점검 수행
+    await run_self_check()
     
     parser = argparse.ArgumentParser(description="Python Indexer with Manual Sync")
     parser.add_argument('-b', '--board', type=str, default='', help='작업할 게시판명 (bo_table)')
     parser.add_argument('-c', '--category', type=str, default='', help='작업할 카테고리명 (ca_name)')
     parser.add_argument('-f', '--force', action='store_true', help='기존 데이터를 무시하고 강제 재색인')
+    parser.add_argument('-s', '--start-date', type=str, default=None, help='시작일 (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYYMMDD)')
+    parser.add_argument('-e', '--end-date', type=str, default=None, help='종료일 (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYYMMDD)')
     
     args = parser.parse_args()
     
@@ -700,20 +873,40 @@ async def main():
     target_category_input = args.category.strip()
     force_update = args.force
 
+    start_date_input = None
+    if args.start_date:
+        try:
+            start_date_input = validate_date(args.start_date, is_end_date=False)
+        except ValueError as e:
+            parser.error(str(e))
+
+    end_date_input = None
+    if args.end_date:
+        try:
+            end_date_input = validate_date(args.end_date, is_end_date=True)
+        except ValueError as e:
+            parser.error(str(e))
+
     if target_board_input:
         print(f"\n[ 수동 작업 모드 ]")
         print(f" 👉 게시판: {target_board_input}")
         if target_category_input:
             print(f" 👉 카테고리: {target_category_input}")
+        if start_date_input:
+            print(f" 👉 시작일: {start_date_input}")
+        if end_date_input:
+            print(f" 👉 종료일: {end_date_input}")
         if force_update:
             print(f" 👉 강제 업데이트(Force) 활성화됨")
         print("=" * 40 + "\n")
 
-    pool_gnuboard = await aiomysql.create_pool(**DB_CONFIG, autocommit=True)
+    # [수정] Stale connection 문제 방지를 위해 pool_recycle 추가 (단위: 초)
+    pool_gnuboard = await aiomysql.create_pool(**DB_CONFIG, autocommit=True, pool_recycle=3600)
     pool_manticore = await aiomysql.create_pool(
         host=MANTICORE_CONFIG['host'], port=MANTICORE_CONFIG['port'], 
         user=MANTICORE_CONFIG['user'], password=MANTICORE_CONFIG['password'], 
-        db=MANTICORE_CONFIG['db'], autocommit=True
+        db=MANTICORE_CONFIG['db'], autocommit=True,
+        pool_recycle=3600
     )
     print("✅ DB Connected.")
 
@@ -739,7 +932,7 @@ async def main():
             print(f"📋 Found {len(target_boards)} boards.")
             
             for bo_table in target_boards:
-                await sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_category_input, force_update)
+                await sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_category_input, force_update, start_date=start_date_input, end_date=end_date_input)
                 
                 # 게시판 하나 끝날 때마다 인덱스 최적화
                 try:
@@ -747,10 +940,12 @@ async def main():
                     async with pool_manticore.acquire() as conn:
                         async with conn.cursor() as cur:
                             await cur.execute(f"FLUSH RAMCHUNK {MANTICORE_INDEX}")
-                except: pass
+                except Exception: pass
 
     except Exception as e:
-        print(f"\n❌ Critical Error: {e}")
+        import traceback
+        print(f"\n❌ Critical Error: An unexpected error occurred. Details below:")
+        traceback.print_exc()
     finally:
         # [수정] 어떠한 경우에도 커넥션 풀을 닫도록 보장 (RuntimeError 방지)
         print("\n🔌 Closing DB connections...")
@@ -762,5 +957,6 @@ async def main():
 
 if __name__ == "__main__":
     if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        # [수정] Windows에서 비동기 서브프로세스(nvidia-smi)를 사용하려면 ProactorEventLoop가 필요합니다.
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())

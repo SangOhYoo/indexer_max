@@ -59,7 +59,12 @@ def run_restore():
         subprocess.run(['wsl', '-u', 'root', 'bash', '-c', f"rm -rf {WSL_DATA_PATH}/*"], check=True)
 
         # 4. 백업 데이터 복원 (WSL -u root 활용)
-        wsl_src = backup_path.replace('\\', '/').replace('D:', '/mnt/d').replace('d:', '/mnt/d')
+        nested_path = os.path.join(backup_path, selected_backup)
+        if not os.path.exists(os.path.join(backup_path, 'data')) and os.path.exists(os.path.join(nested_path, 'data')):
+            print("💡 중첩된 폴더 구조 감지: 하위 폴더 경로로 조정합니다.")
+            backup_path = nested_path
+            
+        wsl_src = backup_path.replace('\\', '/').replace('D:', '/mnt/d').replace('d:', '/mnt/d').replace('D:', '/mnt/d').replace('d:', '/mnt/d')
         print(f"📂 백업 복원 중: {selected_backup} -> WSL")
         
         # 데이터 폴더 내 파일 복사
@@ -71,7 +76,12 @@ def run_restore():
 
         print("✅ 파일 복원 완료.")
 
-        # 5. Manticore 서비스 시작 안내
+        # 5. 소유권 변경 및 권한 설정 (복원 파일들이 root 소유로 되어 기동이 안 되는 문제 해결)
+        print("🔧 소유권 및 권한 조정 중...")
+        subprocess.run(['wsl', '-u', 'root', 'chown', '-R', 'manticore:manticore', WSL_CONF_PATH], check=True)
+        subprocess.run(['wsl', '-u', 'root', 'chmod', '-R', '755', WSL_DATA_PATH], check=True)
+
+        # 6. Manticore 서비스 시작 안내
         print("\n🚀 Manticore 서비스를 다시 시작해 주세요.")
         print("  예시: wsl searchd")
         print("       (또는) wsl sudo service manticore start")
