@@ -30,7 +30,7 @@ IF EXIST "venv" (
 )
 
 REM 아래 실행 코드를 상황에 맞게 수정하여 사용하세요!
-python indexer_max.py -b jp -c "아내의기쁨" -f
+python indexer_max.py -b noc -f
 
 echo.
 pause
