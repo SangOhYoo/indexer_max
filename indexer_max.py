@@ -65,6 +65,47 @@ FETCH_LIMIT = 5000000
 TARGET_CONDITION = ""
 
 # ==============================================================================
+# [PERF] 정규식 사전 컴파일 (80만건 처리 시 컴파일 오버헤드 제거)
+# ==============================================================================
+RE_PARAGRAPH_BREAK = re.compile(r'\n\s*\n')
+RE_JP_NEWLINE = re.compile(r'([ぁ-んァ-ン一-龥])\n')
+RE_KR_NEWLINE = re.compile(r'([^.?!~"\'」』ぁ-んァ-ン一-龥])\n')
+RE_CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+RE_HTML_TAG = re.compile(r'<[^>]+>')
+RE_HTML_ATTR = re.compile(r'[a-zA-Z]+="[^"]*"')
+RE_HTML_ENTITY = re.compile(r'&[a-z]+;')
+RE_URL = re.compile(r'http[s]?://\S+')
+RE_EMAIL = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+RE_JP_BRACKETS = re.compile(r'[「」『』]')
+RE_TSUZUKI = re.compile(r'(続き|つづき)[.．…。]*$')
+RE_KR_NUM = re.compile(r'([a-zA-Z가-힣])(\d+\.)')
+RE_KR_EN1 = re.compile(r'([가-힣])([a-zA-Z0-9])')
+RE_KR_EN2 = re.compile(r'([a-zA-Z0-9])([가-힣])')
+RE_EN_NUM1 = re.compile(r'([a-zA-Z])(\d)')
+RE_EN_NUM2 = re.compile(r'(\d)([a-zA-Z])')
+RE_CAMEL1 = re.compile(r'([a-z])([A-Z])')
+RE_CAMEL2 = re.compile(r'([A-Z]+)([A-Z][a-z])')
+RE_PUNCT_SPACE = re.compile(r'([!?.])(\\S)')
+RE_TOCI_NUM = re.compile(r'(^|\s)\d+\.')
+RE_COMMA_DUP = re.compile(r'(,\s*)+')
+RE_REPEAT_SENT = re.compile(r'(\S+[!?.~]\s?)\1{2,}')
+RE_TILDE = re.compile(r'[~〜]{2,}')
+RE_DASH = re.compile(r'[ー−]{2,}')
+RE_DOTS = re.compile(r'(・\s*){2,}')
+RE_EXCL = re.compile(r'[!！]{2,}')
+RE_QUEST = re.compile(r'[?？]{2,}')
+RE_PERIOD_JP = re.compile(r'。{2,}')
+RE_CHAR_REPEAT = re.compile(r'(\D)\1{5,}')
+RE_LONG_STR = re.compile(r'\S{100,}')
+RE_ELLIPSIS = re.compile(r'(\.\s*){2,}')
+RE_MULTI_SPACE = re.compile(r'\s+')
+# 청크용
+RE_SENT_BOUNDARY = re.compile(r'[.?!。！？]\s')
+RE_JP_SENT_END = re.compile(r'[。！？」』)\n]')
+RE_KR_SENT_END = re.compile(r'[.?!]\s')
+RE_ANY_SENT_END = re.compile(r'(?:[.?!。！？]["\s」』])|(?:\n)')
+
+# ==============================================================================
 # 1. [NEW] 오토 튜너 (AutoTuner) & 리소스 모니터링
 # ==============================================================================
 class AutoTuner:
@@ -88,34 +129,38 @@ class AutoTuner:
         nvidia-smi를 호출하여 GPU 중 가장 높은 메모리 사용률을 반환합니다.
         (보틀넥 방지를 위해 가장 힘든 자원을 기준으로 함)
         """
-        try:
-            # [개선] 비동기 서브프로세스 실행으로 이벤트 루프 블로킹 방지
-            proc = await asyncio.create_subprocess_exec(
-                'nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,nounits,noheader',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
+        def _query_gpu():
+            """동기 함수: subprocess.run으로 nvidia-smi 호출 (파이프 hang 방지)"""
+            try:
+                result = subprocess.run(
+                    ['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,nounits,noheader'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode != 0:
+                    return 0.0
 
-            if proc.returncode != 0:
-                # print(f"nvidia-smi error: {stderr.decode()}") # 디버깅용
+                lines = result.stdout.strip().split('\n')
+                max_gpu_usage = 0.0
+                for line in lines:
+                    if not line: continue
+                    parts = line.split(',')
+                    if len(parts) == 2:
+                        used = float(parts[0].strip())
+                        total = float(parts[1].strip())
+                        if total > 0:
+                            usage = (used / total) * 100
+                            max_gpu_usage = max(max_gpu_usage, usage)
+                return max_gpu_usage
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return 0.0
+            except Exception:
                 return 0.0
 
-            lines = stdout.decode().strip().split('\n')
-            max_gpu_usage = 0.0
-
-            for line in lines:
-                if not line: continue
-                parts = line.split(',')
-                if len(parts) == 2:
-                    used = float(parts[0].strip())
-                    total = float(parts[1].strip())
-                    if total > 0:
-                        usage = (used / total) * 100
-                        max_gpu_usage = max(max_gpu_usage, usage)
-            return max_gpu_usage
-        except FileNotFoundError:
-            # nvidia-smi가 설치되지 않은 경우
+        try:
+            # [수정] run_in_executor로 동기 subprocess 호출 → ProactorEventLoop 파이프 hang 완전 우회
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, _query_gpu)
+        except Exception:
             return 0.0
 
     async def tune(self):
@@ -189,95 +234,79 @@ def clean_text(content):
     except Exception:
         text = str(content)
 
-    # ==============================================================
-    # [NEW] 강제 줄바꿈(Hard Wrap) 해결 로직 (Step 3 이전에 수행 필수)
-    # ==============================================================
-    
-    # 2-1. 명확한 문단 구분(\n\n)은 보호 (임시 마커로 치환)
-    text = re.sub(r'\n\s*\n', '<<PARAGRAPH_BREAK>>', text)
-    
-    # 2-2. [일본어 전용] 일본어 문자 뒤의 줄바꿈은 "공백 없이" 잇는다.
-    # 범위: 히라가나(ぁ-ん), 가타카나(ァ-ン), 한자(一-龥)
-    text = re.sub(r'([ぁ-んァ-ン一-龥])\n', r'\1', text)
-    
-    # 2-3. [한국어/기타] 문장 부호가 아닌 글자 뒤의 줄바꿈은 "공백을 넣고" 잇는다.
-    # 조건: 마침표, 물음표, 느낌표, 따옴표, 괄호, 그리고 일본어 문자가 '아닌' 경우
-    text = re.sub(r'([^.?!~"\'」』ぁ-んァ-ン一-龥])\n', r'\1 ', text)
-    
-    # 2-4. 보호했던 문단 구분을 공백으로 복원 (나중에 whitespace 정리됨)
+    # [강제 줄바꿈 해결]
+    text = RE_PARAGRAPH_BREAK.sub('<<PARAGRAPH_BREAK>>', text)
+    text = RE_JP_NEWLINE.sub(r'\1', text)
+    text = RE_KR_NEWLINE.sub(r'\1 ', text)
     text = text.replace('<<PARAGRAPH_BREAK>>', ' ')
-    
-    # 2-5. 남은 줄바꿈 문자 제거 (Step 3에서 삭제되겠지만 명시적으로 공백 처리)
     text = text.replace('\n', ' ')
-    # ==============================================================
 
-    # 3. 유령 문자(제어 문자) 삭제
-    text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
+    # 3. 제어 문자 삭제 (최적화: regex로 한번에)
+    text = RE_CONTROL_CHARS.sub('', text)
 
     # 4. 찌꺼기 제거
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'[a-zA-Z]+="[^"]*"', '', text)
-    text = re.sub(r'&[a-z]+;', '', text)
-    text = re.sub(r'http[s]?://\S+', '', text)
-    text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '', text)
+    text = RE_HTML_TAG.sub('', text)
+    text = RE_HTML_ATTR.sub('', text)
+    text = RE_HTML_ENTITY.sub('', text)
+    text = RE_URL.sub('', text)
+    text = RE_EMAIL.sub('', text)
     
     # 5. 괄호 변환
     text = text.replace('[', '(').replace(']', ')')
     text = text.replace('(', ' ( ').replace(')', ' ) ') 
 
-    # [NEW] 일본어 괄호 -> 일반 따옴표
-    text = re.sub(r'[「」『』]', ' " ', text)
+    # 일본어 괄호 -> 일반 따옴표
+    text = RE_JP_BRACKETS.sub(' " ', text)
     
-    # [NEW] "続き..." 삭제
-    text = re.sub(r'(続き|つづき)[.．…。]*$', '', text)
+    # "続き..." 삭제
+    text = RE_TSUZUKI.sub('', text)
 
     # 6. 텍스트 분리
-    text = re.sub(r'([a-zA-Z가-힣])(\d+\.)', r'\1 \2', text)
-    text = re.sub(r'([가-힣])([a-zA-Z0-9])', r'\1 \2', text)
-    text = re.sub(r'([a-zA-Z0-9])([가-힣])', r'\1 \2', text)
-    text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
-    text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-    text = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1 \2', text)
-    text = re.sub(r'([!?.])(\S)', r'\1 \2', text)
+    text = RE_KR_NUM.sub(r'\1 \2', text)
+    text = RE_KR_EN1.sub(r'\1 \2', text)
+    text = RE_KR_EN2.sub(r'\1 \2', text)
+    text = RE_EN_NUM1.sub(r'\1 \2', text)
+    text = RE_EN_NUM2.sub(r'\1 \2', text)
+    text = RE_CAMEL1.sub(r'\1 \2', text)
+    text = RE_CAMEL2.sub(r'\1 \2', text)
+    text = RE_PUNCT_SPACE.sub(r'\1 \2', text)
 
     # 7. 목차 번호 삭제
-    text = re.sub(r'(^|\s)\d+\.', ' ', text)
+    text = RE_TOCI_NUM.sub(' ', text)
     
     # 8. 기호 및 반복 정리
     text = text.replace('、', ',') 
-    text = re.sub(r'(,\s*)+', ', ', text)
-    text = re.sub(r'(\S+[!?.~]\s?)\1{2,}', r'\1\1', text)
+    text = RE_COMMA_DUP.sub(', ', text)
+    text = RE_REPEAT_SENT.sub(r'\1\1', text)
+    text = RE_TILDE.sub('~', text)
+    text = RE_DASH.sub('ー', text)
+    text = RE_DOTS.sub('...', text)
+    text = RE_EXCL.sub('!', text)
+    text = RE_QUEST.sub('?', text)
+    text = RE_PERIOD_JP.sub('。', text)
+    text = RE_CHAR_REPEAT.sub(r'\1\1\1', text)
+    text = RE_LONG_STR.sub('', text) 
 
-    text = re.sub(r'[~〜]{2,}', '~', text)
-    text = re.sub(r'[ー−]{2,}', 'ー', text)
-    text = re.sub(r'(・\s*){2,}', '...', text)
-    text = re.sub(r'[!！]{2,}', '!', text)
-    text = re.sub(r'[?？]{2,}', '?', text)
-    text = re.sub(r'。{2,}', '。', text)
-
-    text = re.sub(r'(\D)\1{5,}', r'\1\1\1', text)
-    text = re.sub(r'\S{100,}', '', text) 
-
-    # 공백이 들어간 상태에서도 ... 압축이 잘 되도록 수정
-    text = re.sub(r'(\.\s*){2,}', ' ... ', text)
+    # 공백이 들어간 상태에서도 ... 압축
+    text = RE_ELLIPSIS.sub(' ... ', text)
     
     # 공백 정리
-    text = re.sub(r'\s+', ' ', text)
+    text = RE_MULTI_SPACE.sub(' ', text)
     text = text.strip()
 
-    # [NEW] 문장 앞뒤 기호 찌꺼기 강제 제거
+    # 문장 앞뒤 기호 찌꺼기 강제 제거
     text = text.strip(' !?.,~ー。";')
     
     return text
 
 def chunk_text(text):
-    # [스마트 가변 청크 적용]
-    # CHUNK_SIZE 설정값을 사용하되, 토큰 안전 한도(2000) 이내로 제한
+    # [BGE-M3 최적화 청크]
+    # BGE-M3 max tokens = 8192, 한국어/일본어 1문자 ≈ 2~3 tokens
+    # 안전 한도: 2000자 (≈ 5000 tokens, Manticore 메모리와 균형)
     MAX_LENGTH = min(CHUNK_SIZE, 2000)
-    MIN_LENGTH = 1000
+    MIN_LENGTH = 300    # 너무 짧은 청크 방지 (검색 품질 저하)
     LOOKBACK_RANGE = 500
-    OVERLAP_SIZE = OVERLAP
+    OVERLAP_SIZE = max(OVERLAP, 200)  # 의미 연속성 보장을 위해 최소 200
 
     length = len(text)
     chunks = []
@@ -299,14 +328,23 @@ def chunk_text(text):
         search_text = text[search_start:end_pos]
         
         cut_point = -1
+        
+        # 1순위: 문단 경계 (줄바꿈)
         newline_match = list(re.finditer(r'\n', search_text))
         if newline_match:
             cut_point = search_start + newline_match[-1].end()
-            
+        
+        # 2순위: 문장 경계 (한/일/영 모두)
         if cut_point == -1:
-            sent_match = list(re.finditer(r'[.?!。！？][\s\n]', search_text))
+            sent_match = list(RE_ANY_SENT_END.finditer(search_text))
             if sent_match:
                 cut_point = search_start + sent_match[-1].end()
+        
+        # 3순위: 쉼표/반점 경계 (최후 수단)
+        if cut_point == -1:
+            comma_match = list(re.finditer(r'[,、]\s', search_text))
+            if comma_match:
+                cut_point = search_start + comma_match[-1].end()
         
         if cut_point == -1: cut_point = end_pos
 
@@ -314,7 +352,7 @@ def chunk_text(text):
         if real_chunk.strip(): chunks.append(real_chunk.strip())
         
         next_offset = cut_point - OVERLAP_SIZE
-        # [수정] offset이 반드시 전진하도록 보장 (무한 루프 방지)
+        # offset이 반드시 전진하도록 보장 (무한 루프 방지)
         if next_offset <= offset:
             offset = cut_point
         else:
@@ -425,51 +463,154 @@ async def check_and_create_table(pool_manticore):
                 # [수정] sys.exit(1) 대신 예외를 발생시켜 main에서 처리하게 함
                 raise RuntimeError(f"Manticore table setup failed: {e}")
 
+# ==============================================================================
+# [NEW] GPU 헬스 체커 - Ollama 다운 감지 & 자동 페일오버
+# ==============================================================================
+class OllamaHealthTracker:
+    def __init__(self, hosts):
+        self.hosts = hosts
+        self.host_alive = {i: True for i in range(len(hosts))}
+        self.host_fail_count = {i: 0 for i in range(len(hosts))}
+        self.last_health_check = 0
+        self.health_check_interval = 30  # 30초마다 다운된 호스트 재확인
+        self._round_robin = 0
+    
+    def get_alive_hosts(self):
+        """살아있는 호스트 인덱스 목록 반환"""
+        alive = [i for i, v in self.host_alive.items() if v]
+        return alive if alive else list(range(len(self.hosts)))  # 전부 죽었으면 전부 시도
+    
+    def get_next_host(self):
+        """라운드로빈으로 다음 살아있는 호스트 반환"""
+        alive = self.get_alive_hosts()
+        idx = alive[self._round_robin % len(alive)]
+        self._round_robin += 1
+        return idx
+    
+    def report_failure(self, host_idx):
+        """실패 보고 - 3회 연속 실패 시 다운 판정"""
+        self.host_fail_count[host_idx] += 1
+        if self.host_fail_count[host_idx] >= 3:
+            if self.host_alive[host_idx]:
+                self.host_alive[host_idx] = False
+                alive_count = sum(1 for v in self.host_alive.values() if v)
+                print(f"\n🔴 [GPU {host_idx} DOWN] Ollama at {self.hosts[host_idx]} 응답 없음! (남은 GPU: {alive_count}개)")
+    
+    def report_success(self, host_idx):
+        """성공 보고 - 실패 카운터 리셋"""
+        self.host_fail_count[host_idx] = 0
+        if not self.host_alive[host_idx]:
+            self.host_alive[host_idx] = True
+            print(f"\n🟢 [GPU {host_idx} RECOVERED] Ollama at {self.hosts[host_idx]} 복구됨!")
+    
+    async def check_dead_hosts(self, session):
+        """다운된 호스트를 주기적으로 ping하여 복구 감지"""
+        now = time.time()
+        if now - self.last_health_check < self.health_check_interval:
+            return
+        self.last_health_check = now
+        
+        for idx, alive in self.host_alive.items():
+            if alive:
+                continue
+            try:
+                async with session.get(f"{self.hosts[idx]}/api/tags", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        self.report_success(idx)
+            except Exception:
+                pass
+
+# 전역 헬스 트래커
+health_tracker = OllamaHealthTracker(OLLAMA_HOSTS)
+
 async def get_embedding(session, text, host_idx, sem, bo_table):
     if not text or len(text.strip()) < 2: return None
-    url = f"{OLLAMA_HOSTS[host_idx]}/v1/embeddings"
-    max_retries = 5
-    current_text = text  # 토큰 초과 시 텍스트를 줄여가며 재시도
+    max_retries = 3
+    current_text = text
     
     async with sem:
         for attempt in range(max_retries):
+            # 장애 GPU 회피: 살아있는 호스트로 자동 전환
+            actual_host = host_idx if health_tracker.host_alive.get(host_idx, True) else health_tracker.get_next_host()
+            url = f"{OLLAMA_HOSTS[actual_host]}/v1/embeddings"
+            
             if attempt > 0: 
-                # [수정] 백오프 상한 30초로 제한 (기존: 2^9=512초 가능)
-                wait_time = min(30, (2 ** attempt)) + random.uniform(0, 1)
+                wait_time = min(10, (2 ** attempt)) + random.uniform(0, 0.5)
                 await asyncio.sleep(wait_time)
             
             payload = {"model": "bge-m3", "input": [current_text]}
-            start_time = time.time()
             try:
                 timeout = aiohttp.ClientTimeout(total=60) 
                 async with session.post(url, json=payload, timeout=timeout) as resp:
                     if resp.status == 200:
                         result = await resp.json()
+                        health_tracker.report_success(actual_host)
                         if 'data' in result and len(result['data']) > 0:
                             return result['data'][0]['embedding']
                         return None
                     elif resp.status == 500:
                         error_msg = await resp.text()
                         if "NaN" in error_msg or "unsupported value" in error_msg:
-                            print(f"\n🗑️ [Skip-NaN] Toxic Text Detected")
                             return None
-                        # [NEW] 토큰 초과 에러 감지 → 텍스트를 80%로 잘라서 재시도
                         if "too large to process" in error_msg or "batch size" in error_msg:
-                            old_len = len(current_text)
                             current_text = current_text[:int(len(current_text) * 0.8)]
-                            print(f"\n⚠️ [Token Overflow] Text too long ({old_len} chars). Trimmed to {len(current_text)} chars, retrying...")
                             continue
-                        if attempt < max_retries - 1:
-                            continue 
-                        else:
-                            return None
-                    else:
+                        health_tracker.report_failure(actual_host)
                         if attempt < max_retries - 1: continue
                         return None
-            except Exception as e:
+                    else:
+                        health_tracker.report_failure(actual_host)
+                        if attempt < max_retries - 1: continue
+                        return None
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                health_tracker.report_failure(actual_host)
                 if attempt < max_retries - 1: continue
-                else: return None
+                return None
+            except Exception:
+                if attempt < max_retries - 1: continue
+                return None
     return None
+
+async def get_batch_embeddings(session, texts, sem):
+    """[NEW] 배치 임베딩 - 여러 텍스트를 한 번의 API 호출로 처리 (대폭 속도 향상)"""
+    if not texts: return [None] * len(texts)
+    
+    BATCH_LIMIT = 8  # Ollama는 한 번에 처리할 수 있는 input 수 제한
+    results = [None] * len(texts)
+    
+    for batch_start in range(0, len(texts), BATCH_LIMIT):
+        batch_texts = texts[batch_start:batch_start + BATCH_LIMIT]
+        host_idx = health_tracker.get_next_host()
+        url = f"{OLLAMA_HOSTS[host_idx]}/v1/embeddings"
+        
+        async with sem:
+            payload = {"model": "bge-m3", "input": batch_texts}
+            try:
+                timeout = aiohttp.ClientTimeout(total=120)
+                async with session.post(url, json=payload, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        result = await resp.json()
+                        health_tracker.report_success(host_idx)
+                        if 'data' in result:
+                            for item in result['data']:
+                                idx = item.get('index', 0)
+                                if batch_start + idx < len(results):
+                                    results[batch_start + idx] = item['embedding']
+                    else:
+                        # 배치 실패 시 개별 처리로 폴백
+                        health_tracker.report_failure(host_idx)
+                        for i, txt in enumerate(batch_texts):
+                            emb = await get_embedding(session, txt, health_tracker.get_next_host(), sem, "")
+                            if batch_start + i < len(results):
+                                results[batch_start + i] = emb
+            except Exception:
+                health_tracker.report_failure(host_idx)
+                for i, txt in enumerate(batch_texts):
+                    emb = await get_embedding(session, txt, health_tracker.get_next_host(), sem, "")
+                    if batch_start + i < len(results):
+                        results[batch_start + i] = emb
+    
+    return results
 
 async def get_parent_info(conn, write_table, parent_id, cache):
     if parent_id in cache: return cache[parent_id]
@@ -533,7 +674,6 @@ async def process_item_embedding(session, row, bo_table, parent_cache, sem):
     
     chunks = chunk_text(clean_body)
     results = []
-    tasks = []
     valid_chunks = []
     valid_indices = []
 
@@ -545,11 +685,8 @@ async def process_item_embedding(session, row, bo_table, parent_cache, sem):
 
     if not valid_chunks: return []
 
-    for i, chunk in enumerate(valid_chunks):
-        host_idx = (wr_id + i) % len(OLLAMA_HOSTS)
-        tasks.append(get_embedding(session, chunk, host_idx, sem, bo_table))
-    
-    embeddings = await asyncio.gather(*tasks)
+    # [최적화] 배치 임베딩 사용 - 한 문서의 모든 청크를 한 번에 처리
+    embeddings = await get_batch_embeddings(session, valid_chunks, sem)
 
     for i, embedding in enumerate(embeddings):
         if not embedding: continue
@@ -662,10 +799,9 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
         gc.collect()
         return
 
-    update_ids = [uid for uid in to_upsert if uid in mc_ids]
-    if update_ids:
-        print(f"🧹 Pre-cleaning {len(update_ids)} posts for update...")
-        await delete_from_manticore(pool_manticore, bo_table, update_ids)
+    # [수정] 전체 선삭제(Pre-cleaning) 제거 → 배치 단위 삭제로 변경 (전원 차단 시 데이터 보호)
+    # 기존: 업데이트 대상 전체를 한꺼번에 삭제 → 전원 나가면 삭제된 상태로 데이터 소실
+    # 변경: 각 배치 직전에 해당 배치만 삭제 후 즉시 삽입 → 최대 손실 = 1개 배치분
 
     to_upsert.sort()
     total_ops = len(to_upsert)
@@ -673,14 +809,27 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
     parent_cache = {}
 
     current_idx = 0
+    FLUSH_COUNT_INTERVAL = 500   # [전원 보호] N건마다 FLUSH
+    FLUSH_TIME_INTERVAL = 60.0   # [전원 보호] N초마다 FLUSH (이중 보호)
+    last_flush_idx = 0
+    last_flush_time = time.time()
+    board_start_time = time.time()
     
     while current_idx < total_ops:
         dynamic_batch, cool_down = await tuner.tune()
         if cool_down > 0: await asyncio.sleep(cool_down)
 
+        # [NEW] 주기적으로 다운된 GPU 복구 확인
+        await health_tracker.check_dead_hosts(session)
+
         end_idx = min(current_idx + dynamic_batch, total_ops)
         batch_ids = to_upsert[current_idx : end_idx]
         ids_str = ",".join(map(str, batch_ids))
+
+        # [전원 보호] 배치 단위 삭제: 이 배치에서 업데이트할 ID만 직전에 삭제
+        batch_update_ids = [uid for uid in batch_ids if uid in mc_ids]
+        if batch_update_ids:
+            await delete_from_manticore(pool_manticore, bo_table, batch_update_ids)
         
         rows = []
         # ======================================================================
@@ -697,7 +846,6 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
         except UnicodeDecodeError:
             print(f"\n⚠️ [Encoding Error] Batch fetch failed. Retrying item-by-item to isolate corrupt data...")
             rows = []
-            # 배치 전체가 실패했으므로, 하나씩 가져와서 문제 있는 녀석만 건너뜀
             for single_id in batch_ids:
                 try:
                     async with pool_gnuboard.acquire() as conn:
@@ -720,7 +868,6 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
         try:
             for row in rows:
                 if row['wr_is_comment'] == 1:
-                    # 댓글 부모 정보 조회 시에도 오류 가능성 있으므로 예외 처리
                     try:
                         if not current_conn: current_conn = await pool_gnuboard.acquire()
                         p_info = await get_parent_info(current_conn, write_table, row['wr_parent'], parent_cache)
@@ -745,11 +892,31 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
             await insert_bulk_manticore(pool_manticore, bulk_values)
 
         current_idx = end_idx
-        print(f"\r🚀 Processing {bo_table}: {current_idx}/{total_ops} (Batch: {dynamic_batch}) ...", end="")
+        now = time.time()
+
+        # [전원 보호] 이중 FLUSH: 건수 OR 시간 기준 중 먼저 도달하면 FLUSH
+        need_flush = (current_idx - last_flush_idx >= FLUSH_COUNT_INTERVAL) or (now - last_flush_time >= FLUSH_TIME_INTERVAL)
+        if need_flush:
+            try:
+                async with pool_manticore.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(f"FLUSH RAMCHUNK {MANTICORE_INDEX}")
+                last_flush_idx = current_idx
+                last_flush_time = now
+            except Exception:
+                pass
+
+        # [NEW] 속도 표시
+        elapsed = now - board_start_time
+        speed = current_idx / elapsed if elapsed > 0 else 0
+        eta_sec = (total_ops - current_idx) / speed if speed > 0 else 0
+        eta_min = int(eta_sec / 60)
+        alive_gpus = sum(1 for v in health_tracker.host_alive.values() if v)
+        print(f"\r🚀 {bo_table}: {current_idx}/{total_ops} (B:{dynamic_batch} | {speed:.1f}/s | ETA:{eta_min}m | GPU:{alive_gpus}) ", end="")
 
     print(f"\n✨ {bo_table} Sync Completed.")
     
-    del gb_map, mc_map, to_delete, to_upsert, rows, processing_tasks
+    del gb_map, mc_map, to_delete, to_upsert
     gc.collect()
 
 # ==============================================================================
@@ -855,7 +1022,7 @@ async def run_self_check():
         print("========================================================\n")
 
 async def main():
-    print(f"=== Python Indexer V7.1 (Auto-Tuned) ===")
+    print(f"=== Python Indexer V8.0 (Dual-GPU Optimized) ===")
     
     # 자가점검 수행
     await run_self_check()
@@ -900,20 +1067,30 @@ async def main():
             print(f" 👉 강제 업데이트(Force) 활성화됨")
         print("=" * 40 + "\n")
 
-    # [수정] Stale connection 문제 방지를 위해 pool_recycle 추가 (단위: 초)
-    pool_gnuboard = await aiomysql.create_pool(**DB_CONFIG, autocommit=True, pool_recycle=3600)
+    # [최적화] 커넥션 풀 크기 증가 + 더 빈번한 재활용
+    pool_gnuboard = await aiomysql.create_pool(
+        **DB_CONFIG, autocommit=True, pool_recycle=1800,
+        minsize=5, maxsize=20
+    )
     pool_manticore = await aiomysql.create_pool(
         host=MANTICORE_CONFIG['host'], port=MANTICORE_CONFIG['port'], 
         user=MANTICORE_CONFIG['user'], password=MANTICORE_CONFIG['password'], 
         db=MANTICORE_CONFIG['db'], autocommit=True,
-        pool_recycle=3600
+        pool_recycle=1800, minsize=3, maxsize=10
     )
     print("✅ DB Connected.")
 
     try:
         await check_and_create_table(pool_manticore)
 
-        async with aiohttp.ClientSession() as session:
+        # [최적화] GPU별 연결 제한이 있는 커넥터 사용
+        connector = aiohttp.TCPConnector(
+            limit=64,              # 총 동시 연결 수
+            limit_per_host=32,     # 호스트당 최대 연결
+            keepalive_timeout=300, # keep-alive 5분 유지
+            enable_cleanup_closed=True
+        )
+        async with aiohttp.ClientSession(connector=connector) as session:
             target_boards = []
             if target_board_input:
                 target_boards.append(target_board_input)
@@ -947,7 +1124,6 @@ async def main():
         print(f"\n❌ Critical Error: An unexpected error occurred. Details below:")
         traceback.print_exc()
     finally:
-        # [수정] 어떠한 경우에도 커넥션 풀을 닫도록 보장 (RuntimeError 방지)
         print("\n🔌 Closing DB connections...")
         pool_gnuboard.close()
         await pool_gnuboard.wait_closed()
@@ -957,6 +1133,5 @@ async def main():
 
 if __name__ == "__main__":
     if os.name == 'nt':
-        # [수정] Windows에서 비동기 서브프로세스(nvidia-smi)를 사용하려면 ProactorEventLoop가 필요합니다.
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(main())
