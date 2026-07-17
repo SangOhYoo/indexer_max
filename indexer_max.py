@@ -910,9 +910,20 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
         elapsed = now - board_start_time
         speed = current_idx / elapsed if elapsed > 0 else 0
         eta_sec = (total_ops - current_idx) / speed if speed > 0 else 0
-        eta_min = int(eta_sec / 60)
+        
+        # 시분초 변환
+        eta_h = int(eta_sec // 3600)
+        eta_m = int((eta_sec % 3600) // 60)
+        eta_s = int(eta_sec % 60)
+        if eta_h > 0:
+            eta_str = f"{eta_h}시간 {eta_m}분 {eta_s}초"
+        elif eta_m > 0:
+            eta_str = f"{eta_m}분 {eta_s}초"
+        else:
+            eta_str = f"{eta_s}초"
+            
         alive_gpus = sum(1 for v in health_tracker.host_alive.values() if v)
-        print(f"\r🚀 {bo_table}: {current_idx}/{total_ops} (B:{dynamic_batch} | {speed:.1f}/s | ETA:{eta_min}m | GPU:{alive_gpus}) ", end="")
+        print(f"\r🚀 {bo_table}: {current_idx}/{total_ops} (B:{dynamic_batch} | {speed:.1f}/s | ETA:{eta_str} | GPU:{alive_gpus}) ", end="")
 
     print(f"\n✨ {bo_table} Sync Completed.")
     
@@ -1103,7 +1114,7 @@ async def main():
                             bo_id = r[0][len(TABLE_PREFIX):]
                             if bo_id: target_boards.append(bo_id)
                 
-                PRIORITY_LIST = ['noc','jp','wm','private','trs','sora','wolf','yajun',] 
+                PRIORITY_LIST = ['wolf','sora','yajun','noc','jp','wm','private','trs',] 
                 target_boards.sort(key=lambda x: PRIORITY_LIST.index(x) if x in PRIORITY_LIST else 999)
             
             print(f"📋 Found {len(target_boards)} boards.")
