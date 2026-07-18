@@ -5,7 +5,7 @@ set CUDA_VISIBLE_DEVICES=0
 REM ★ 핵심: BGE-M3 안정 병렬 처리 (16이 최적, 64는 OOM 위험)
 set OLLAMA_NUM_PARALLEL=16
 REM 모델이 메모리에서 내려가지 않도록 유지
-set OLLAMA_KEEP_ALIVE=24h
+set OLLAMA_KEEP_ALIVE=5m
 echo [GPU 0] Parallel Service Started...
 ollama serve
 pause

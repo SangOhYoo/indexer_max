@@ -571,18 +571,36 @@ async def get_embedding(session, text, host_idx, sem, bo_table):
                 return None
     return None
 
-async def get_batch_embeddings(session, texts, sem):
-    """[NEW] 배치 임베딩 - 여러 텍스트를 한 번의 API 호출로 처리 (대폭 속도 향상)"""
+async def get_batch_embeddings(session, texts, sem, host_idx=None):
+    """
+    [v8.1] 배치 임베딩 - 듀얼 GPU 병렬 분산 처리
+    host_idx 지정 시 해당 GPU 우선 사용, 미지정 시 라운드로빈.
+    서브배치가 여러 개면 GPU별로 나눠 동시 발사 (asyncio.gather).
+    """
     if not texts: return [None] * len(texts)
     
     BATCH_LIMIT = 8  # Ollama는 한 번에 처리할 수 있는 input 수 제한
     results = [None] * len(texts)
     
-    for batch_start in range(0, len(texts), BATCH_LIMIT):
+    # 1. 서브배치 분할 + GPU 할당
+    sub_batches = []
+    alive_hosts = health_tracker.get_alive_hosts()
+    for i, batch_start in enumerate(range(0, len(texts), BATCH_LIMIT)):
         batch_texts = texts[batch_start:batch_start + BATCH_LIMIT]
-        host_idx = health_tracker.get_next_host()
-        url = f"{OLLAMA_HOSTS[host_idx]}/v1/embeddings"
-        
+        if host_idx is not None:
+            # 멀티 서브배치인 경우 GPU를 교대 배정 (큰 문서도 양쪽 GPU 활용)
+            start_pos = alive_hosts.index(host_idx) if host_idx in alive_hosts else 0
+            target = alive_hosts[(start_pos + i) % len(alive_hosts)]
+        else:
+            target = health_tracker.get_next_host()
+        sub_batches.append((batch_start, batch_texts, target))
+    
+    # 2. 각 서브배치를 병렬로 처리하는 내부 코루틴
+    failed_batches = []  # 실패한 서브배치를 나중에 폴백 처리
+    
+    async def _fire_sub_batch(batch_start, batch_texts, target_host):
+        """하나의 서브배치를 지정 GPU로 발사"""
+        url = f"{OLLAMA_HOSTS[target_host]}/v1/embeddings"
         async with sem:
             payload = {"model": "bge-m3", "input": batch_texts}
             try:
@@ -590,25 +608,30 @@ async def get_batch_embeddings(session, texts, sem):
                 async with session.post(url, json=payload, timeout=timeout) as resp:
                     if resp.status == 200:
                         result = await resp.json()
-                        health_tracker.report_success(host_idx)
+                        health_tracker.report_success(target_host)
                         if 'data' in result:
                             for item in result['data']:
                                 idx = item.get('index', 0)
                                 if batch_start + idx < len(results):
                                     results[batch_start + idx] = item['embedding']
+                        return
                     else:
-                        # 배치 실패 시 개별 처리로 폴백
-                        health_tracker.report_failure(host_idx)
-                        for i, txt in enumerate(batch_texts):
-                            emb = await get_embedding(session, txt, health_tracker.get_next_host(), sem, "")
-                            if batch_start + i < len(results):
-                                results[batch_start + i] = emb
+                        health_tracker.report_failure(target_host)
             except Exception:
-                health_tracker.report_failure(host_idx)
-                for i, txt in enumerate(batch_texts):
-                    emb = await get_embedding(session, txt, health_tracker.get_next_host(), sem, "")
-                    if batch_start + i < len(results):
-                        results[batch_start + i] = emb
+                health_tracker.report_failure(target_host)
+        # 여기까지 오면 실패 → 폴백 목록에 추가
+        failed_batches.append((batch_start, batch_texts))
+    
+    # 3. 모든 서브배치를 동시 발사 (핵심: 양쪽 GPU에 동시 요청)
+    await asyncio.gather(*[_fire_sub_batch(bs, bt, th) for bs, bt, th in sub_batches])
+    
+    # 4. 실패한 서브배치만 개별 폴백 (sem 밖에서 호출하므로 데드락 없음)
+    for batch_start, batch_texts in failed_batches:
+        for i, txt in enumerate(batch_texts):
+            result_idx = batch_start + i
+            if result_idx < len(results) and results[result_idx] is None:
+                emb = await get_embedding(session, txt, health_tracker.get_next_host(), sem, "")
+                results[result_idx] = emb
     
     return results
 
@@ -662,7 +685,7 @@ async def insert_bulk_manticore(pool_manticore, values_list):
                         else:
                             print(f"\n❌ [DB Fail] Final Insert Error: {e}")
 
-async def process_item_embedding(session, row, bo_table, parent_cache, sem):
+async def process_item_embedding(session, row, bo_table, parent_cache, sem, host_idx=None):
     wr_id = row['wr_id']
     clean_body = clean_text(row['wr_content'])
     if not clean_body or len(clean_body.strip()) < 10: return []
@@ -685,8 +708,8 @@ async def process_item_embedding(session, row, bo_table, parent_cache, sem):
 
     if not valid_chunks: return []
 
-    # [최적화] 배치 임베딩 사용 - 한 문서의 모든 청크를 한 번에 처리
-    embeddings = await get_batch_embeddings(session, valid_chunks, sem)
+    # [v8.1] 지정된 GPU로 배치 임베딩 (듀얼 GPU 균등 분산)
+    embeddings = await get_batch_embeddings(session, valid_chunks, sem, host_idx=host_idx)
 
     for i, embedding in enumerate(embeddings):
         if not embedding: continue
@@ -879,7 +902,10 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
                     except Exception:
                          row['wr_subject'] = "[Comment] (Parent Info Error)"
 
-                processing_tasks.append(process_item_embedding(session, row, bo_table, parent_cache, sem))
+                # [v8.1] 문서마다 살아있는 GPU를 교대 배정 → 양쪽 GPU 균등 사용
+                alive_hosts = health_tracker.get_alive_hosts()
+                target_gpu = alive_hosts[len(processing_tasks) % len(alive_hosts)]
+                processing_tasks.append(process_item_embedding(session, row, bo_table, parent_cache, sem, host_idx=target_gpu))
         finally:
             if current_conn: pool_gnuboard.release(current_conn)
 
@@ -903,6 +929,7 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
                         await cur.execute(f"FLUSH RAMCHUNK {MANTICORE_INDEX}")
                 last_flush_idx = current_idx
                 last_flush_time = now
+                print(f"\n💾 [Auto Save] RAMCHUNK Flushed at {current_idx} items.")
             except Exception:
                 pass
 
@@ -1033,7 +1060,7 @@ async def run_self_check():
         print("========================================================\n")
 
 async def main():
-    print(f"=== Python Indexer V8.0 (Dual-GPU Optimized) ===")
+    print(f"=== Python Indexer V8.1 (Dual-GPU Balanced) ===")
     
     # 자가점검 수행
     await run_self_check()
