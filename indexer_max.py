@@ -688,7 +688,12 @@ async def insert_bulk_manticore(pool_manticore, values_list):
 async def process_item_embedding(session, row, bo_table, parent_cache, sem, host_idx=None):
     wr_id = row['wr_id']
     clean_body = clean_text(row['wr_content'])
-    if not clean_body or len(clean_body.strip()) < 10: return []
+    
+    # 본문이 너무 짧은 경우 무한 Upsert(재시도) 방지를 위해 제목으로 대체
+    if not clean_body or len(clean_body.strip()) < 10:
+        clean_body = clean_text(row['wr_subject'])
+        if not clean_body or len(clean_body.strip()) < 2:
+            clean_body = "내용없음"
 
     final_subject = row['wr_subject']
     final_category = row['ca_name'] if row['ca_name'] else ""
@@ -1141,7 +1146,7 @@ async def main():
                             bo_id = r[0][len(TABLE_PREFIX):]
                             if bo_id: target_boards.append(bo_id)
                 
-                PRIORITY_LIST = ['wolf','sora','yajun','noc','jp','wm','private','trs',] 
+                PRIORITY_LIST = ['trs','yajun','sora','private','wolf','noc','jp','wm',] 
                 target_boards.sort(key=lambda x: PRIORITY_LIST.index(x) if x in PRIORITY_LIST else 999)
             
             print(f"📋 Found {len(target_boards)} boards.")
