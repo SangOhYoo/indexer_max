@@ -60,6 +60,9 @@ CONCURRENCY = config['settings']['concurrency']
 
 FETCH_LIMIT = 5000000
 
+# [설정] 스마트 청크 자동 백업 주기
+BACKUP_CHUNK_INTERVAL = 10000
+
 # [설정] 인덱싱 대상 필터 조건 (wr_good이 0보다 큰 경우, 즉 1부터 인덱싱)
 # TARGET_CONDITION = " WHERE wr_good > 0 "
 TARGET_CONDITION = ""
@@ -843,6 +846,10 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
     last_flush_time = time.time()
     board_start_time = time.time()
     
+    total_chunks_processed = 0
+    last_backup_chunk_count = 0
+    
+
     while current_idx < total_ops:
         dynamic_batch, cool_down = await tuner.tune()
         if cool_down > 0: await asyncio.sleep(cool_down)
@@ -921,9 +928,31 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
         
         if bulk_values:
             await insert_bulk_manticore(pool_manticore, bulk_values)
+            total_chunks_processed += len(bulk_values)
 
         current_idx = end_idx
         now = time.time()
+
+        # [자동 백업] 스마트 청크 기준 주기적 백업
+        if total_chunks_processed - last_backup_chunk_count >= BACKUP_CHUNK_INTERVAL:
+            print(f"\n📦 [Auto Backup] {total_chunks_processed}개 청크 누적 처리됨. 자동 백업을 시작합니다...")
+            try:
+                # 파이썬 인터프리터로 backup_manticore.py 직접 실행
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, 'backup_manticore.py'
+                )
+                await proc.wait()
+                if proc.returncode == 0:
+                    print(f"✅ 자동 백업 성공. 인덱싱 작업을 재개합니다.")
+                else:
+                    print(f"⚠️ 자동 백업 실패 (에러 코드: {proc.returncode})")
+            except Exception as e:
+                print(f"❌ 자동 백업 실행 중 예외 발생: {e}")
+            
+            last_backup_chunk_count = total_chunks_processed
+            now = time.time()
+            last_flush_time = now
+
 
         # [전원 보호] 이중 FLUSH: 건수 OR 시간 기준 중 먼저 도달하면 FLUSH
         need_flush = (current_idx - last_flush_idx >= FLUSH_COUNT_INTERVAL) or (now - last_flush_time >= FLUSH_TIME_INTERVAL)
@@ -1146,7 +1175,7 @@ async def main():
                             bo_id = r[0][len(TABLE_PREFIX):]
                             if bo_id: target_boards.append(bo_id)
                 
-                PRIORITY_LIST = ['trs','yajun','sora','private','wolf','noc','jp','wm',] 
+                PRIORITY_LIST = ['trs','yajun','sora','wolf','private','wm','noc','jp',] 
                 target_boards.sort(key=lambda x: PRIORITY_LIST.index(x) if x in PRIORITY_LIST else 999)
             
             print(f"📋 Found {len(target_boards)} boards.")
