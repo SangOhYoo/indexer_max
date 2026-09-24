@@ -15,6 +15,11 @@ import subprocess
 import unicodedata
 import gc
 import psutil  # [필수] pip install psutil
+try:
+    import pynvml
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
 from datetime import datetime
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 
@@ -60,8 +65,16 @@ CONCURRENCY = config['settings']['concurrency']
 
 FETCH_LIMIT = 5000000
 
+# [설정] 백엔드 타입 (자동 감지 후 config.json에 기록됨)
+DETECTED_BACKEND = config.get('backend', None)  # "llamacpp" or "ollama" or None(미감지)
+
+# [설정] BATCH_LIMIT: 백엔드에 따라 동적 결정
+# - llama.cpp: 서버가 -b 8192로 대용량 배치 처리 가능 → 64
+# - ollama: 내부 배치 크기 제한이 있으므로 → 8
+EMBEDDING_BATCH_LIMIT = 64 if DETECTED_BACKEND == 'llamacpp' else 8
+
 # [설정] 스마트 청크 자동 백업 주기
-BACKUP_CHUNK_INTERVAL = 10000
+BACKUP_CHUNK_INTERVAL = 100000
 
 # [설정] 인덱싱 대상 필터 조건 (wr_good이 0보다 큰 경우, 즉 1부터 인덱싱)
 # TARGET_CONDITION = " WHERE wr_good > 0 "
@@ -107,6 +120,8 @@ RE_SENT_BOUNDARY = re.compile(r'[.?!。！？]\s')
 RE_JP_SENT_END = re.compile(r'[。！？」』)\n]')
 RE_KR_SENT_END = re.compile(r'[.?!]\s')
 RE_ANY_SENT_END = re.compile(r'(?:[.?!。！？]["\s」』])|(?:\n)')
+RE_NEWLINE = re.compile(r'\n')
+RE_COMMA_SPACE = re.compile(r'[,、]\s')
 
 # ==============================================================================
 # 1. [NEW] 오토 튜너 (AutoTuner) & 리소스 모니터링
@@ -119,19 +134,60 @@ class AutoTuner:
         self.max_batch = 200       # 최대 배치 (메모리 보호 상한선)
         
         self.cool_down = 0.0       # 과부하 시 휴식 시간
-        self.check_interval = 1.0  # 1초마다 상태 체크
+        self.check_interval = 1.0  # 1초마다 상태 체크 (pynvml 사용으로 오버헤드 극소)
         self.last_check = 0
         
         # [임계값 설정]
         self.TARGET_LOAD = 85.0    # 목표 부하율 (이 수치 근처 유지 노력)
         self.CRITICAL_LIMIT = 95.0 # 위험 한계선 (즉시 감속)
+        
+        # [Phase 2] pynvml 초기화
+        self._nvml_initialized = False
+        self._gpu_handles = []
+        if PYNVML_AVAILABLE:
+            try:
+                pynvml.nvmlInit()
+                gpu_count = pynvml.nvmlDeviceGetCount()
+                self._gpu_handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(gpu_count)]
+                self._nvml_initialized = True
+            except Exception:
+                self._nvml_initialized = False
+
+    def shutdown_nvml(self):
+        """[Phase 2] pynvml 리소스 정리"""
+        if self._nvml_initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_initialized = False
 
     async def get_dual_gpu_usage(self):
         """
         [핵심] 듀얼 GPU 사용률 체크
-        nvidia-smi를 호출하여 GPU 중 가장 높은 메모리 사용률을 반환합니다.
+        [Phase 2] pynvml 사용 → 프로세스 spawn 없이 직접 NVML C API 호출
         (보틀넥 방지를 위해 가장 힘든 자원을 기준으로 함)
         """
+        # [Phase 2] pynvml 우선 사용 (프로세스 spawn 없음, ~1ms 이내)
+        if self._nvml_initialized:
+            def _query_gpu_nvml():
+                try:
+                    max_gpu_usage = 0.0
+                    for handle in self._gpu_handles:
+                        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        if info.total > 0:
+                            usage = (info.used / info.total) * 100
+                            max_gpu_usage = max(max_gpu_usage, usage)
+                    return max_gpu_usage
+                except Exception:
+                    return 0.0
+            try:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, _query_gpu_nvml)
+            except Exception:
+                return 0.0
+
+        # [폴백] pynvml 미사용 시 기존 nvidia-smi subprocess 방식
         def _query_gpu():
             """동기 함수: subprocess.run으로 nvidia-smi 호출 (파이프 hang 방지)"""
             try:
@@ -231,11 +287,16 @@ def clean_text(content):
     content = content.replace('<br>', ' ').replace('<br/>', ' ').replace('</p>', ' ').replace('</div>', ' ')
     content = html.unescape(content)
 
-    try:
-        soup = BeautifulSoup(content, "lxml")
-        text = soup.get_text(separator="  ") 
-    except Exception:
-        text = str(content)
+    # [Phase 2] BeautifulSoup 경량화: HTML 태그가 없으면 파서 생략
+    if '<' not in content:
+        # 태그 없는 순수 텍스트 → BeautifulSoup 인스턴스 생성 불필요
+        text = content
+    else:
+        try:
+            soup = BeautifulSoup(content, "lxml")
+            text = soup.get_text(separator="  ") 
+        except Exception:
+            text = str(content)
 
     # [강제 줄바꿈 해결]
     text = RE_PARAGRAPH_BREAK.sub('<<PARAGRAPH_BREAK>>', text)
@@ -333,7 +394,7 @@ def chunk_text(text):
         cut_point = -1
         
         # 1순위: 문단 경계 (줄바꿈)
-        newline_match = list(re.finditer(r'\n', search_text))
+        newline_match = list(RE_NEWLINE.finditer(search_text))  # [Phase 2] 사전 컴파일 패턴 사용
         if newline_match:
             cut_point = search_start + newline_match[-1].end()
         
@@ -345,7 +406,7 @@ def chunk_text(text):
         
         # 3순위: 쉼표/반점 경계 (최후 수단)
         if cut_point == -1:
-            comma_match = list(re.finditer(r'[,、]\s', search_text))
+            comma_match = list(RE_COMMA_SPACE.finditer(search_text))  # [Phase 2] 사전 컴파일 패턴 사용
             if comma_match:
                 cut_point = search_start + comma_match[-1].end()
         
@@ -370,6 +431,7 @@ def generate_manticore_id(bo_table, wr_id, seq):
 
 def parse_timestamp(value):
     if not value: return 0
+    if isinstance(value, (int, float)): return int(value)
     if isinstance(value, datetime): return int(value.timestamp())
     if isinstance(value, str):
         try:
@@ -497,14 +559,14 @@ class OllamaHealthTracker:
             if self.host_alive[host_idx]:
                 self.host_alive[host_idx] = False
                 alive_count = sum(1 for v in self.host_alive.values() if v)
-                print(f"\n🔴 [GPU {host_idx} DOWN] Ollama at {self.hosts[host_idx]} 응답 없음! (남은 GPU: {alive_count}개)")
+                print(f"\n🔴 [GPU {host_idx} DOWN] LLM Server at {self.hosts[host_idx]} 응답 없음! (남은 GPU: {alive_count}개)")
     
     def report_success(self, host_idx):
         """성공 보고 - 실패 카운터 리셋"""
         self.host_fail_count[host_idx] = 0
         if not self.host_alive[host_idx]:
             self.host_alive[host_idx] = True
-            print(f"\n🟢 [GPU {host_idx} RECOVERED] Ollama at {self.hosts[host_idx]} 복구됨!")
+            print(f"\n🟢 [GPU {host_idx} RECOVERED] LLM Server at {self.hosts[host_idx]} 복구됨!")
     
     async def check_dead_hosts(self, session):
         """다운된 호스트를 주기적으로 ping하여 복구 감지"""
@@ -516,8 +578,19 @@ class OllamaHealthTracker:
         for idx, alive in self.host_alive.items():
             if alive:
                 continue
+            
+            # 1. Ollama 헬스 체크
             try:
                 async with session.get(f"{self.hosts[idx]}/api/tags", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        self.report_success(idx)
+                        continue
+            except Exception:
+                pass
+                
+            # 2. llama.cpp 헬스 체크
+            try:
+                async with session.get(f"{self.hosts[idx]}/v1/models", timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
                         self.report_success(idx)
             except Exception:
@@ -525,6 +598,21 @@ class OllamaHealthTracker:
 
 # 전역 헬스 트래커
 health_tracker = OllamaHealthTracker(OLLAMA_HOSTS)
+
+def is_valid_embedding(emb, expected_dim=1024):
+    """임베딩 벡터가 유효한 실수 리스트인지 검증 (None, NaN, 차원 불일치 방지)"""
+    if not emb or not isinstance(emb, (list, tuple)):
+        return False
+    if len(emb) != expected_dim:
+        return False
+    for x in emb:
+        if x is None:
+            return False
+        if not isinstance(x, (int, float)):
+            return False
+        if isinstance(x, float) and (x != x):  # NaN 검출 (NaN != NaN)
+            return False
+    return True
 
 async def get_embedding(session, text, host_idx, sem, bo_table):
     if not text or len(text.strip()) < 2: return None
@@ -549,7 +637,9 @@ async def get_embedding(session, text, host_idx, sem, bo_table):
                         result = await resp.json()
                         health_tracker.report_success(actual_host)
                         if 'data' in result and len(result['data']) > 0:
-                            return result['data'][0]['embedding']
+                            emb = result['data'][0].get('embedding')
+                            if is_valid_embedding(emb):
+                                return emb
                         return None
                     elif resp.status == 500:
                         error_msg = await resp.text()
@@ -574,16 +664,19 @@ async def get_embedding(session, text, host_idx, sem, bo_table):
                 return None
     return None
 
-async def get_batch_embeddings(session, texts, sem, host_idx=None):
+async def get_batch_embeddings(session, texts, sem, host_idx=None, batch_sem=None):
     """
-    [v8.1] 배치 임베딩 - 듀얼 GPU 병렬 분산 처리
+    [v8.2] 배치 임베딩 - 듀얼 GPU 병렬 분산 처리
     host_idx 지정 시 해당 GPU 우선 사용, 미지정 시 라운드로빈.
     서브배치가 여러 개면 GPU별로 나눠 동시 발사 (asyncio.gather).
+    [Phase 2] batch_sem으로 배치 전용 세마포어 분리 (단건 sem과 경합 방지)
     """
     if not texts: return [None] * len(texts)
     
-    BATCH_LIMIT = 8  # Ollama는 한 번에 처리할 수 있는 input 수 제한
+    BATCH_LIMIT = EMBEDDING_BATCH_LIMIT  # 백엔드에 따라 동적 결정 (llama.cpp=64, ollama=8)
     results = [None] * len(texts)
+    # [Phase 2] 배치 전용 세마포어가 없으면 기존 sem 사용 (하위 호환)
+    effective_sem = batch_sem if batch_sem is not None else sem
     
     # 1. 서브배치 분할 + GPU 할당
     sub_batches = []
@@ -604,7 +697,7 @@ async def get_batch_embeddings(session, texts, sem, host_idx=None):
     async def _fire_sub_batch(batch_start, batch_texts, target_host):
         """하나의 서브배치를 지정 GPU로 발사"""
         url = f"{OLLAMA_HOSTS[target_host]}/v1/embeddings"
-        async with sem:
+        async with effective_sem:  # [Phase 2] 배치 전용 세마포어 사용
             payload = {"model": "bge-m3", "input": batch_texts}
             try:
                 timeout = aiohttp.ClientTimeout(total=120)
@@ -616,7 +709,9 @@ async def get_batch_embeddings(session, texts, sem, host_idx=None):
                             for item in result['data']:
                                 idx = item.get('index', 0)
                                 if batch_start + idx < len(results):
-                                    results[batch_start + idx] = item['embedding']
+                                    emb = item.get('embedding')
+                                    if is_valid_embedding(emb):
+                                        results[batch_start + idx] = emb
                         return
                     else:
                         health_tracker.report_failure(target_host)
@@ -632,9 +727,10 @@ async def get_batch_embeddings(session, texts, sem, host_idx=None):
     for batch_start, batch_texts in failed_batches:
         for i, txt in enumerate(batch_texts):
             result_idx = batch_start + i
-            if result_idx < len(results) and results[result_idx] is None:
+            if result_idx < len(results) and not is_valid_embedding(results[result_idx]):
                 emb = await get_embedding(session, txt, health_tracker.get_next_host(), sem, "")
-                results[result_idx] = emb
+                if is_valid_embedding(emb):
+                    results[result_idx] = emb
     
     return results
 
@@ -661,13 +757,23 @@ async def delete_from_manticore(pool_manticore, bo_table, wr_id_list):
 
 async def insert_bulk_manticore(pool_manticore, values_list):
     if not values_list: return
+    # [안전장치] 벡터에 None 또는 nan이 포함된 비정상 데이터 사전 필터링
+    valid_values = []
+    for val in values_list:
+        vec = val[-1]
+        if not isinstance(vec, str) or "None" in vec or "nan" in vec.lower():
+            print(f"\n⚠️ [Sanity Check] 비정상 벡터 감지 (wr_id={val[7]}, chunk_seq={val[9]}), DB 삽입에서 제외됨")
+            continue
+        valid_values.append(val)
+    if not valid_values: return
+
     SAFE_CHUNK_LIMIT = 2000 
-    total_count = len(values_list)
+    total_count = len(valid_values)
     
     async with pool_manticore.acquire() as conn:
         async with conn.cursor() as cur:
             for i in range(0, total_count, SAFE_CHUNK_LIMIT):
-                current_batch = values_list[i : i + SAFE_CHUNK_LIMIT]
+                current_batch = valid_values[i : i + SAFE_CHUNK_LIMIT]
                 placeholders = []
                 params = []
                 for val in current_batch:
@@ -688,7 +794,7 @@ async def insert_bulk_manticore(pool_manticore, values_list):
                         else:
                             print(f"\n❌ [DB Fail] Final Insert Error: {e}")
 
-async def process_item_embedding(session, row, bo_table, parent_cache, sem, host_idx=None):
+async def process_item_embedding(session, row, bo_table, parent_cache, sem, host_idx=None, **kwargs):
     wr_id = row['wr_id']
     clean_body = clean_text(row['wr_content'])
     
@@ -696,7 +802,7 @@ async def process_item_embedding(session, row, bo_table, parent_cache, sem, host
     if not clean_body or len(clean_body.strip()) < 10:
         clean_body = clean_text(row['wr_subject'])
         if not clean_body or len(clean_body.strip()) < 2:
-            clean_body = "내용없음"
+            clean_body = "내용이 없는 게시물"
 
     final_subject = row['wr_subject']
     final_category = row['ca_name'] if row['ca_name'] else ""
@@ -714,13 +820,18 @@ async def process_item_embedding(session, row, bo_table, parent_cache, sem, host
         valid_chunks.append(chunk)
         valid_indices.append(idx)
 
+    # [안전장치] 모든 청크가 필터링된 경우, clean_body 전체를 1개 청크로 강제 사용
+    if not valid_chunks and clean_body and len(clean_body.strip()) >= 2:
+        valid_chunks = [clean_body.strip()]
+        valid_indices = [0]
+
     if not valid_chunks: return []
 
     # [v8.1] 지정된 GPU로 배치 임베딩 (듀얼 GPU 균등 분산)
-    embeddings = await get_batch_embeddings(session, valid_chunks, sem, host_idx=host_idx)
+    embeddings = await get_batch_embeddings(session, valid_chunks, sem, host_idx=host_idx, batch_sem=kwargs.get('batch_sem'))
 
     for i, embedding in enumerate(embeddings):
-        if not embedding: continue
+        if not is_valid_embedding(embedding): continue
         real_idx = valid_indices[i]
         m_id, board_hash = generate_manticore_id(bo_table, wr_id, real_idx)
         vec_str = "(" + ",".join(map(str, embedding)) + ")"
@@ -792,10 +903,10 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
         async with pool_manticore.acquire() as conn:
             async with conn.cursor() as cur:
                 print(f"   Reading Manticore metadata...")
-                sql = f"SELECT wr_id, wr_last FROM {MANTICORE_INDEX} WHERE bo_table='{bo_table}' GROUP BY wr_id LIMIT {FETCH_LIMIT} OPTION max_matches={FETCH_LIMIT}"
+                sql = f"SELECT wr_id, MAX(wr_last) AS wr_last FROM {MANTICORE_INDEX} WHERE bo_table='{bo_table}' GROUP BY wr_id LIMIT {FETCH_LIMIT} OPTION max_matches={FETCH_LIMIT}"
                 await cur.execute(sql)
                 rows = await cur.fetchall()
-                for r in rows: mc_map[r[0]] = int(r[1])
+                for r in rows: mc_map[r[0]] = parse_timestamp(r[1])
     except Exception as e:
         print(f"❌ Error reading Manticore: {e}")
         return
@@ -837,6 +948,8 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
     to_upsert.sort()
     total_ops = len(to_upsert)
     sem = asyncio.Semaphore(CONCURRENCY)
+    # [Phase 2] 배치 전용 세마포어: GPU 수 × 4 (배치와 단건 폴백의 세마포어 경합 방지)
+    batch_sem = asyncio.Semaphore(len(OLLAMA_HOSTS) * 4)
     parent_cache = {}
 
     current_idx = 0
@@ -917,7 +1030,7 @@ async def sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_ca
                 # [v8.1] 문서마다 살아있는 GPU를 교대 배정 → 양쪽 GPU 균등 사용
                 alive_hosts = health_tracker.get_alive_hosts()
                 target_gpu = alive_hosts[len(processing_tasks) % len(alive_hosts)]
-                processing_tasks.append(process_item_embedding(session, row, bo_table, parent_cache, sem, host_idx=target_gpu))
+                processing_tasks.append(process_item_embedding(session, row, bo_table, parent_cache, sem, host_idx=target_gpu, batch_sem=batch_sem))
         finally:
             if current_conn: pool_gnuboard.release(current_conn)
 
@@ -1037,31 +1150,50 @@ async def run_self_check():
     except Exception as e:
         print(f"  [+] Manticore Search ({MANTICORE_CONFIG['host']}:{MANTICORE_CONFIG['port']}): 🔴 연결 실패 ({e})")
 
-    # 3. Ollama Hosts
+    # 3. LLM Server Hosts
     ollama_ok = False
     active_ollama_hosts = 0
     async with aiohttp.ClientSession() as session:
         for idx, host in enumerate(OLLAMA_HOSTS):
+            host_is_up = False
+            model_found = False
+            
+            # 1) Try Ollama
             try:
-                # Check status via /api/tags
                 async with session.get(f"{host}/api/tags", timeout=3) as resp:
                     if resp.status == 200:
+                        host_is_up = True
                         data = await resp.json()
-                        models = [m.get('name') for m in data.get('models', [])]
-                        # Check if bge-m3 is loaded
-                        model_found = any('bge-m3' in m.lower() for m in models)
-                        model_status = "🟢 'bge-m3' 로드됨" if model_found else "⚠️ 'bge-m3' 모델 미지점 (설치된 모델 목록 확인 필요)"
-                        print(f"  [+] Ollama Host {idx+1} ({host}):")
-                        print(f"      - 서비스 상태: 🟢 가동 중 (Running)")
-                        print(f"      - 모델 상태:   {model_status}")
-                        if model_found:
-                            active_ollama_hosts += 1
-                    else:
-                        print(f"  [+] Ollama Host {idx+1} ({host}): 🔴 HTTP 오류 (상태 코드: {resp.status})")
-            except Exception as e:
-                print(f"  [+] Ollama Host {idx+1} ({host}): 🔴 연결 실패 ({e})")
+                        models = [m.get('name', '') for m in data.get('models', [])]
+                        if any('bge-m3' in str(m).lower() for m in models):
+                            model_found = True
+            except Exception:
+                pass
                 
-    if active_ollama_hosts == len(OLLAMA_HOSTS) and len(OLLAMA_HOSTS) > 0:
+            # 2) Try llama.cpp (OpenAI format) if not up
+            if not host_is_up:
+                try:
+                    async with session.get(f"{host}/v1/models", timeout=3) as resp:
+                        if resp.status == 200:
+                            host_is_up = True
+                            data = await resp.json()
+                            models = [m.get('id', '') for m in data.get('data', [])]
+                            if any('bge-m3' in str(m).lower() for m in models):
+                                model_found = True
+                except Exception:
+                    pass
+
+            if host_is_up:
+                model_status = "🟢 'bge-m3' 로드됨" if model_found else "⚠️ 'bge-m3' 모델 미지정 (설치된 모델 목록 확인 필요)"
+                print(f"  [+] LLM Server {idx+1} ({host}):")
+                print(f"      - 서비스 상태: 🟢 가동 중 (Running)")
+                print(f"      - 모델 상태:   {model_status}")
+                if model_found:
+                    active_ollama_hosts += 1
+            else:
+                print(f"  [+] LLM Server {idx+1} ({host}): 🔴 연결 실패 또는 서버 응답 없음")
+                
+    if active_ollama_hosts > 0:
         ollama_ok = True
 
     print("========================================================")
@@ -1075,9 +1207,9 @@ async def run_self_check():
             print("  - Manticore Search 연결 실패 (Manticore 서비스 작동 상태 확인 필요)")
         if not ollama_ok:
             if len(OLLAMA_HOSTS) == 0:
-                print("  - 설정 파일에 Ollama 호스트 정보가 없습니다.")
+                print("  - 설정 파일에 LLM 호스트 정보가 없습니다.")
             elif active_ollama_hosts < len(OLLAMA_HOSTS):
-                print(f"  - 일부 Ollama 호스트가 비활성 상태이거나 'bge-m3' 모델이 없습니다. ({active_ollama_hosts}/{len(OLLAMA_HOSTS)} 정상)")
+                print(f"  - 일부 LLM 호스트가 비활성 상태이거나 'bge-m3' 모델이 없습니다. ({active_ollama_hosts}/{len(OLLAMA_HOSTS)} 정상)")
         print("========================================================")
         
         try:
@@ -1093,11 +1225,88 @@ async def run_self_check():
         print("🟢 모든 필수 서비스가 정상 작동 중입니다.")
         print("========================================================\n")
 
+async def detect_backend(hosts):
+    """
+    [자동 감지] LLM 서버가 Ollama인지 llama.cpp인지 자동으로 판별하고
+    config.json에 결과를 기록합니다.
+    """
+    global DETECTED_BACKEND, EMBEDDING_BATCH_LIMIT
+    
+    async with aiohttp.ClientSession() as session:
+        for host in hosts:
+            # 1) Ollama 전용 엔드포인트 체크
+            try:
+                async with session.get(f"{host}/api/tags", timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if 'models' in data:
+                            detected = 'ollama'
+                            print(f"🔍 [Backend Auto-Detect] Ollama 감지됨 ({host})")
+                            _update_backend_config(detected)
+                            return detected
+            except Exception:
+                pass
+            
+            # 2) llama.cpp 전용 엔드포인트 체크
+            try:
+                async with session.get(f"{host}/v1/models", timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # llama.cpp는 /v1/models에 응답하지만 /api/tags에는 응답하지 않음
+                        detected = 'llamacpp'
+                        print(f"🔍 [Backend Auto-Detect] llama.cpp 감지됨 ({host})")
+                        _update_backend_config(detected)
+                        return detected
+            except Exception:
+                pass
+    
+    print(f"⚠️ [Backend Auto-Detect] 백엔드를 감지할 수 없습니다. 기본값(ollama) 사용")
+    return 'ollama'
+
+def _update_backend_config(backend_type):
+    """감지된 백엔드 타입을 config.json에 기록"""
+    global DETECTED_BACKEND, EMBEDDING_BATCH_LIMIT
+    
+    DETECTED_BACKEND = backend_type
+    EMBEDDING_BATCH_LIMIT = 64 if backend_type == 'llamacpp' else 8
+    
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        
+        if cfg.get('backend') != backend_type:
+            cfg['backend'] = backend_type
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=4, ensure_ascii=False)
+            print(f"   ✅ config.json 업데이트 완료: backend = \"{backend_type}\"")
+            print(f"   📦 BATCH_LIMIT = {EMBEDDING_BATCH_LIMIT} (백엔드 최적화 적용)")
+    except Exception as e:
+        print(f"   ⚠️ config.json 업데이트 실패: {e}")
+
+def format_elapsed_time(seconds):
+    """초 단위 시간을 시:분:초 형식 문자열로 변환"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}시간 {m}분 {s}초"
+    elif m > 0:
+        return f"{m}분 {s}초"
+    else:
+        return f"{s}초"
+
 async def main():
-    print(f"=== Python Indexer V8.1 (Dual-GPU Balanced) ===")
+    main_start_time = time.time()
+    print(f"=== Python Indexer V8.3 (Dual-GPU + Phase 2 Optimized) ===")
     
     # 자가점검 수행
     await run_self_check()
+    
+    # [NEW] 백엔드 자동 감지 (config.json에 기록이 없거나 첫 실행 시)
+    if not DETECTED_BACKEND:
+        await detect_backend(OLLAMA_HOSTS)
+    else:
+        print(f"🔍 [Backend] config.json에서 로드: {DETECTED_BACKEND} (BATCH_LIMIT={EMBEDDING_BATCH_LIMIT})")
     
     parser = argparse.ArgumentParser(description="Python Indexer with Manual Sync")
     parser.add_argument('-b', '--board', type=str, default='', help='작업할 게시판명 (bo_table)')
@@ -1175,12 +1384,26 @@ async def main():
                             bo_id = r[0][len(TABLE_PREFIX):]
                             if bo_id: target_boards.append(bo_id)
                 
-                PRIORITY_LIST = ['trs','yajun','sora','wolf','private','wm','noc','jp',] 
+                PRIORITY_LIST = ['noc','jp','wm','trs','private','wolf','sora','yajun',] 
                 target_boards.sort(key=lambda x: PRIORITY_LIST.index(x) if x in PRIORITY_LIST else 999)
             
             print(f"📋 Found {len(target_boards)} boards.")
             
+            # [Phase 2] 글로벌 ETA: 전체 게시판 진행 상황 추적
+            global_board_idx = 0
+            global_board_total = len(target_boards)
+            
             for bo_table in target_boards:
+                global_board_idx += 1
+                if global_board_total > 1:
+                    global_elapsed = time.time() - main_start_time
+                    if global_board_idx > 1 and global_elapsed > 0:
+                        avg_per_board = global_elapsed / (global_board_idx - 1)
+                        remaining_boards = global_board_total - global_board_idx + 1
+                        global_eta = avg_per_board * remaining_boards
+                        print(f"\n📊 [Global Progress] 게시판 {global_board_idx}/{global_board_total} | 경과: {format_elapsed_time(global_elapsed)} | 예상 잔여: {format_elapsed_time(global_eta)}")
+                    else:
+                        print(f"\n📊 [Global Progress] 게시판 {global_board_idx}/{global_board_total}")
                 await sync_board(session, pool_gnuboard, pool_manticore, bo_table, target_category_input, force_update, start_date=start_date_input, end_date=end_date_input)
                 
                 # 게시판 하나 끝날 때마다 인덱스 최적화
@@ -1201,6 +1424,16 @@ async def main():
         await pool_gnuboard.wait_closed()
         pool_manticore.close()
         await pool_manticore.wait_closed()
+        
+        # [Phase 2] pynvml 리소스 정리
+        tuner.shutdown_nvml()
+        
+        # [NEW] 전체 소요시간 출력
+        total_elapsed = time.time() - main_start_time
+        print("\n" + "=" * 60)
+        print(f"⏱️  전체 인덱싱 소요시간: {format_elapsed_time(total_elapsed)}")
+        print(f"    (총 {total_elapsed:.1f}초)")
+        print("=" * 60)
         print("👋 Finished.")
 
 if __name__ == "__main__":
