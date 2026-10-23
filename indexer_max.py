@@ -1414,6 +1414,17 @@ async def main():
                             await cur.execute(f"FLUSH RAMCHUNK {MANTICORE_INDEX}")
                 except Exception: pass
 
+            # [공간 회수] 모든 게시판 인덱싱 완료 후 Manticore 테이블 최적화 (삭제된 killed_documents 물리적 제거 및 청크 압축)
+            try:
+                print(f"\n🚀 [Optimize] 모든 게시판 인덱싱 완료. Manticore 디스크 청크 최적화(OPTIMIZE TABLE) 실행 중...")
+                async with pool_manticore.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(f"FLUSH RAMCHUNK {MANTICORE_INDEX}")
+                        await cur.execute(f"OPTIMIZE TABLE {MANTICORE_INDEX}")
+                print(f"✅ [Optimize] Manticore 인덱스 최적화 완료 (삭제 공간 회수 및 청크 정리)")
+            except Exception as opt_err:
+                print(f"⚠️ [Optimize Warning] 인덱스 최적화 실패: {opt_err}")
+
     except Exception as e:
         import traceback
         print(f"\n❌ Critical Error: An unexpected error occurred. Details below:")
